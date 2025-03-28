@@ -125,6 +125,8 @@ if __name__ == "__main__":
     groups = list(nx.connected_components(G))
     print("Line groups to merge:", groups)
 
+
+
     merged_lines = []
     merged_indices = set()
     for group in groups:
