@@ -1,12 +1,49 @@
 ## Imports-------------------------------------------------------
 import geopandas as gpd
 import matplotlib.pyplot as plt
+from matplotlib.pyplot import annotate
 from shapely.geometry import LineString, Point
 import math
-import networkx as nx
 from shapely.ops import linemerge, unary_union
+import logging
 
 ## Functions -----------------------------------------------------
+
+def plot_lines(gdf, annotate = False, ax=None):
+    # Plot the lines
+    fig, ax = plt.subplots(figsize=(6, 6))
+    gdf.plot(ax=ax, color='black', linewidth=2)
+
+    if annotate:
+        # Annotate each line with its label
+        for idx, line in enumerate(gdf.geometry):
+            x, y = line.coords[0]  # Get the starting point of the line
+            ax.annotate(str(idx), (x+.1, y+.1), color='blue', fontsize=10, weight='bold')
+    plt.title("Original Line Segments with Annotations")
+    plt.axis('equal')
+    plt.show()
+
+def flatten_multilines(gdf):
+    """
+    Converts MultiLineStrings into separate LineStrings,
+    and assigns a 'parent_id' to track origin.
+    """
+    from shapely.geometry import MultiLineString
+
+    single_parts = []
+    parent_ids = []
+    for idx, geom in enumerate(gdf.geometry):
+        if geom.geom_type == 'LineString':
+            single_parts.append(geom)
+            parent_ids.append(idx)
+        elif geom.geom_type == 'MultiLineString':
+            for part in geom.geoms:
+                single_parts.append(part)
+                parent_ids.append(idx)
+        else:
+            print(f"Unsupported geometry type: {geom.geom_type}")
+    return gpd.GeoDataFrame({'geometry': single_parts, 'parent_id': parent_ids}, crs=gdf.crs)
+
 
 def angle_between_lines(line1, line2):
     """
@@ -50,7 +87,6 @@ def directional_collinearity_score(line1, line2):
     length1 = math.hypot(dx, dy)
     if length1 == 0:
         return float('inf')  # degenerate line
-
     ux, uy = dx / length1, dy / length1
 
     # Find closest point on line2 to end of line1
@@ -75,37 +111,18 @@ def is_merge_candidate(line1, line2, angle_thresh=10, dist_thresh=2.0, collinear
     score = directional_collinearity_score(line1, line2)
     return score < collinearity_thresh
 
-def extend_line(line, distance=2.0): # do we need this function anymore?
-    from shapely.geometry import LineString
-    x0, y0 = line.coords[0]
-    x1, y1 = line.coords[-1]
-
-    dx = x1 - x0
-    dy = y1 - y0
-    length = math.hypot(dx, dy)
-    ux = dx / length
-    uy = dy / length
-
-    new_start = (x0 - ux * distance, y0 - uy * distance)
-    new_end = (x1 + ux * distance, y1 + uy * distance)
-    return LineString([new_start, new_end])
-
-def find_merge_pairs(gdf, angle_thresh=16, dist_thresh=2.0, collinearity_thresh=0.5):
-    merge_pairs = []
-    for i, line1 in enumerate(gdf.geometry):
-        for j, line2 in enumerate(gdf.geometry):
-            if i >= j:
-                continue
-            if is_merge_candidate(line1, line2, angle_thresh, dist_thresh, collinearity_thresh):
-                merge_pairs.append((i, j))
-    return merge_pairs
 
 def connect_lines_by_bridge(lines_to_merge):
+    """
+    Connects the nearest endpoints of a set of lines using a straight bridge line.
+    Returns a merged LineString (or longest part of MultiLineString) and the connector.
+    """
     endpoints = []
     for ln in lines_to_merge:
         endpoints.append(Point(ln.coords[0]))
         endpoints.append(Point(ln.coords[-1]))
 
+    # Find closest pair of endpoints
     min_dist = float("inf")
     pair = (None, None)
     for i in range(len(endpoints)):
@@ -117,43 +134,103 @@ def connect_lines_by_bridge(lines_to_merge):
 
     connector = LineString([pair[0], pair[1]])
     combined = unary_union(lines_to_merge + [connector])
-    return linemerge(combined), connector
+    merged = linemerge(combined)
 
-def locally_merge_lines(lines, search_dist=10.0, angle_thresh=3, collinearity_thresh=0.5):
-    lines = list(lines)  # mutable copy
+    # Handle case where linemerge returns MultiLineString
+    if merged.geom_type == 'MultiLineString':
+        # Option 1: pick longest part
+        merged = max(merged.geoms, key=lambda g: g.length)
+
+    return merged, connector
+
+
+
+def locally_merge_lines(gdf, search_dist=10.0, angle_thresh=20, collinearity_thresh=0.5):
+    """
+        Greedily merges nearby lines, avoiding merging parts of the same parent feature.
+        Returns merged lines, connector lines, and the number of merges performed.
+    """
+    lines = list(gdf.geometry)
+    # Assign parent IDs if not already present
+    if 'parent_id' in gdf.columns:
+        parent_ids = list(gdf['parent_id'])
+    else:
+        parent_ids = list(range(len(lines)))  # assign unique ID to each line
+
+    connectors = []
+    merge_count = 0
     i = 0
     while i < len(lines):
         line = lines[i]
         match_found = False
-
+        # Find candidate indices within range
+        candidates = []
         for j in range(len(lines)):
             if i == j:
                 continue
-
-            # Skip if lines are far apart
-            if line.distance(lines[j]) > search_dist:
+            if parent_ids[i] == parent_ids[j]:
                 continue
+            d = line.distance(lines[j])
+            if d <= search_dist:
+                candidates.append((j, d))
 
-            # Check angle, collinearity, etc.
-            if is_merge_candidate(line, lines[j], angle_thresh, dist_thresh=search_dist, collinearity_thresh=collinearity_thresh):
-                # Build bridge + merged line
+        # Sort by distance (closest first)
+        candidates = sorted(candidates, key=lambda x: x[1])
+
+        # Now iterate through sorted candidates
+        for j, _ in candidates:
+            if is_merge_candidate(line, lines[j], angle_thresh, search_dist, collinearity_thresh):
                 merged_line, connector = connect_lines_by_bridge([line, lines[j]])
-
-                # Replace line i with merged
                 lines[i] = merged_line
-
-                # Remove line j
+                parent_ids[i] = min(parent_ids[i], parent_ids[j])
                 lines.pop(j)
+                parent_ids.pop(j)
+                connectors.append(connector)
+                merge_count += 1
                 match_found = True
-                break  # restart with updated line[i]
+                break
 
         if not match_found:
-            i += 1  # move to next line
+            i += 1
 
-    return lines
+    print(f'{merge_count} merges were completed')
+    return lines, connectors
+
+
+def plot_results(original_gdf, merged_gdf, connectors_gdf, search_dist, angle_thresh, collinearity_thresh, annotate = False):
+    fig, ax = plt.subplots(figsize=(8, 8))
+    merged_gdf.plot(ax=ax, color='blue', linewidth=2, label='Merged Lines')
+    original_gdf.plot(ax=ax, color='red', linewidth=2, label='Original Lines')
+    if not connectors_gdf.empty:
+        connectors_gdf.plot(ax=ax, color='green', linewidth=2, linestyle=':', label='Connectors')
+    if annotate:
+        for idx, line in enumerate(original_gdf.geometry):
+            x, y = line.coords[0]  # Get the starting point of the line
+            ax.annotate(str(idx), (x+.1, y+.1), color='blue', fontsize=10, weight='bold')
+    else:
+        print('Lines not annotated')
+    subtitle = f"search_dist: {search_dist}, angle_thresh: {angle_thresh}°, collinearity_thresh: {collinearity_thresh}"
+    plt.title("Merged Lineaments with Connectors\n" + subtitle)
+    plt.legend()
+    plt.axis('equal')
+    plt.show()
+
+def report_metadata(gdf_original, gdf_new, search_dist, angle_thresh, collinearity_thresh):
+    print("\n--- Lineament Merge Report ---")
+    print("Original GeoDataFrame:")
+    print(f" - CRS: {gdf_original.crs}")
+    print(f" - Feature count: {len(gdf_original)}")
+    print("New GeoDataFrame:")
+    print(f" - CRS: {gdf_new.crs}")
+    print(f" - Feature count: {len(gdf_new)}")
+    print(f"Parameters used:")
+    print(f" - Search distance: {search_dist} {gdf_original.crs.axis_info[0].unit_name if gdf_original.crs else 'units'}")
+    print(f" - Angle threshold: {angle_thresh} degrees")
+    print(f" - Collinearity threshold: {collinearity_thresh} {gdf_original.crs.axis_info[0].unit_name if gdf_original.crs else 'units'}")
+    print("-------------------------------\n")
 
 if __name__ == "__main__":
-    # Create synthetic lines for testing
+    #Create synthetic lines for testing
     lines = [
         LineString([(0, 0), (5, 5)]),  # Line 0
         LineString([(5.2, 5.2), (10, 10)]),  # Line 1- near 0, same direction
@@ -169,39 +246,62 @@ if __name__ == "__main__":
     ]
 
     gdf = gpd.GeoDataFrame(geometry=lines)
+    plot_lines(gdf, annotate=True)
 
-    # Plot the lines
-    fig, ax = plt.subplots(figsize=(6, 6))
-    gdf.plot(ax=ax, color='black', linewidth=2)
-
-    labels = ['0', '1', '2', '3', '4', '5','6','7','8','9','10']  # Labels for the lines
+    search_dist = 5
+    angle_thresh = 20
+    collinearity_thresh = 1
 
 
-    # Annotate each line with its label
-    for idx, line in enumerate(gdf.geometry):
-        x, y = line.coords[0]  # Get the starting point of the line
-        ax.annotate(labels[idx], (x, y), color='blue', fontsize=12, weight='bold')
+    new_lines, connectors = locally_merge_lines(gdf, search_dist, angle_thresh, collinearity_thresh)
+    gdf_new = gpd.GeoDataFrame(geometry=new_lines, crs=gdf.crs)
+    connectors_gdf = gpd.GeoDataFrame(geometry=connectors, crs=gdf.crs)
 
-    plt.title("Original Line Segments with Annotations")
-    plt.axis('equal')
-    plt.show()
+    # Save connectors to file
+    #connectors_gdf.to_file("connectors_only.shp")
+    #gdf_new.to_file("Merged_lines.shp")
 
-    new_merged_lines = locally_merge_lines(lines, search_dist=10.0, angle_thresh=20, collinearity_thresh=0.5)
-    gdf_new = gpd.GeoDataFrame(geometry=new_merged_lines)
+    logging.basicConfig(filename='merge_log.txt', level=logging.INFO)
 
-    # Plot the lines
-    fig, ax = plt.subplots(figsize=(6, 6))
-    gdf_new.plot(ax=ax, color='blue', linewidth=2)
-    gdf.plot(ax=ax, color='red', linewidth=2)
+    logging.info("Started processing")
+    logging.info(f"Input CRS: {gdf.crs}")
+    logging.info(f"Number of features: {len(gdf)}")
 
-    # Annotate each line with its label
-    #for idx, line in enumerate(gdf_new.geometry):
-    #   x, y = line.coords[0]  # Get the starting point of the line
-        # ax.annotate(labels[idx], (x, y), color='blue', fontsize=12, weight='bold')
+    # Plot
+    plot_results(gdf, gdf_new, connectors_gdf, search_dist, angle_thresh, collinearity_thresh)
 
-    plt.title("Merged Lines")
-    plt.axis('equal')
-    plt.show()
+    # Metadata Report
+    report_metadata(gdf, gdf_new, search_dist, angle_thresh, collinearity_thresh)
+
+    # input_path = "Lineament_sample.shp"  # replace with your shapefile path
+    # gdf = gpd.read_file(input_path)
+    # gdf = flatten_multilines(gdf)
+    #
+    # plot_lines(gdf)
+    #
+    # search_dist = 1000
+    # angle_thresh = 40
+    # collinearity_thresh = 10
+    #
+    # new_lines, connectors = locally_merge_lines(gdf, search_dist, angle_thresh, collinearity_thresh)
+    # gdf_new = gpd.GeoDataFrame(geometry=new_lines, crs=gdf.crs)
+    # connectors_gdf = gpd.GeoDataFrame(geometry=connectors, crs=gdf.crs)
+
+    # Save connectors to file
+    # connectors_gdf.to_file("connectors_only.shp")
+    # gdf_new.to_file("Merged_lines.shp")
+
+    logging.basicConfig(filename='merge_log.txt', level=logging.INFO)
+
+    logging.info("Started processing")
+    logging.info(f"Input CRS: {gdf.crs}")
+    logging.info(f"Number of features: {len(gdf)}")
+
+    # Plot
+    plot_results(gdf, gdf_new, connectors_gdf, search_dist, angle_thresh, collinearity_thresh)
+
+    # Metadata Report
+    report_metadata(gdf, gdf_new, search_dist, angle_thresh, collinearity_thresh)
 
 
 
